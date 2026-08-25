@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+bin/
+lib/
+*.o
+*.a
+*.dylib
+*.so
+
+# CMake temporary files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+.cache/
+
+# IDE and OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Plugins
+*.vst3
+*.component
+*.au
+*.app
