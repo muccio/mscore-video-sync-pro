@@ -66,11 +66,20 @@ public:
 
     // File loading
     bool loadVideoFile(const juce::File& file);
+    void closeVideoFile();
     juce::String getLoadedVideoPath() const;
+
+    // Persistent storage helpers (Application Support fallback)
+    void savePersistentSettings();
+    void loadPersistentSettings();
 
 private:
     FFmpegDecoder decoder_;
     TempoMapTracker tempoTracker_;
+
+    juce::AudioParameterFloat* paramOffset_{ nullptr };
+    juce::AudioParameterChoice* paramSmpteRate_{ nullptr };
+    juce::AudioParameterChoice* paramSyncMode_{ nullptr };
 
     std::atomic<SMPTEFrameRate> smpteRate_{ SMPTEFrameRate::FPS_24 };
     std::atomic<double> videoOffsetSeconds_{ 0.0 };

@@ -65,7 +65,7 @@ private:
     void cleanupFFmpeg();
 
     // Frame decoding and conversion helpers
-    bool decodeNextFrame(bool& reachedEof);
+    bool decodeNextFrame(bool& reachedEof, double targetCommitPts = -1.0);
     bool performSeek(double targetSeconds);
     void convertFrameToImage(AVFrame* srcFrame, DecodedVideoFrame* destFrame);
 
@@ -91,6 +91,7 @@ private:
     std::atomic<double> targetPts_{ 0.0 };
     std::atomic<bool> seekRequested_{ false };
     std::atomic<double> seekTargetPts_{ 0.0 };
+    std::atomic<double> lastSeekTargetPts_{ -1.0 };
 
     // Frame buffer
     LockFreeFrameQueue frameQueue_;

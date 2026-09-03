@@ -9,6 +9,36 @@ MScoreVideoSyncProcessor::MScoreVideoSyncProcessor()
                      .withInput("Input", juce::AudioChannelSet::stereo(), true)
                      .withOutput("Output", juce::AudioChannelSet::stereo(), true))
 {
+    // Register parameters for VST3 automation and dirty-state tracking
+    addParameter(paramOffset_ = new juce::AudioParameterFloat(
+        juce::ParameterID("videoOffset", 1),
+        "Video Offset",
+        juce::NormalisableRange<float>(-30.0f, 30.0f, 0.001f),
+        0.0f,
+        juce::AudioParameterFloatAttributes().withLabel("s")));
+
+    juce::StringArray smpteNames;
+    for (int i = 0; i < static_cast<int>(SMPTEFrameRate::Count); ++i)
+        smpteNames.add(getFrameRateLabel(static_cast<SMPTEFrameRate>(i)));
+
+    addParameter(paramSmpteRate_ = new juce::AudioParameterChoice(
+        juce::ParameterID("smpteRate", 1),
+        "SMPTE Rate",
+        smpteNames,
+        static_cast<int>(SMPTEFrameRate::FPS_24)));
+
+    juce::StringArray syncNames;
+    for (int i = 0; i < static_cast<int>(SyncMode::Count); ++i)
+        syncNames.add(getSyncModeLabel(static_cast<SyncMode>(i)));
+
+    addParameter(paramSyncMode_ = new juce::AudioParameterChoice(
+        juce::ParameterID("syncMode", 1),
+        "Sync Mode",
+        syncNames,
+        static_cast<int>(SyncMode::DAWPlayHead)));
+
+    // Load persistent settings fallback
+    loadPersistentSettings();
 }
 
 MScoreVideoSyncProcessor::~MScoreVideoSyncProcessor()
@@ -66,12 +96,17 @@ void MScoreVideoSyncProcessor::changeProgramName(int /*index*/, const juce::Stri
 void MScoreVideoSyncProcessor::prepareToPlay(double /*sampleRate*/, int /*samplesPerBlock*/)
 {
     tempoTracker_.resetInternalClock();
-    decoder_.startThread(juce::Thread::Priority::high);
+    if (!decoder_.isThreadRunning())
+    {
+        decoder_.startThread(juce::Thread::Priority::high);
+    }
 }
 
 void MScoreVideoSyncProcessor::releaseResources()
 {
-    decoder_.stopThread(2000);
+    // Note: Do NOT stop decoder_ thread here.
+    // Video decoding thread must remain active while audio engine is paused or idle
+    // so scrubbing, note selection, and UI rendering continue to work.
 }
 
 bool MScoreVideoSyncProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
@@ -167,6 +202,63 @@ juce::AudioProcessorEditor* MScoreVideoSyncProcessor::createEditor()
     return new PluginEditor(*this);
 }
 
+static juce::File getSettingsFile()
+{
+    auto dir = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                   .getChildFile("MScoreVideoSyncPro");
+    if (!dir.exists())
+    {
+        dir.createDirectory();
+    }
+    return dir.getChildFile("settings.xml");
+}
+
+void MScoreVideoSyncProcessor::savePersistentSettings()
+{
+    juce::XmlElement xml("MScoreVideoSyncSettings");
+    xml.setAttribute("lastVideoPath", lastLoadedVideoPath_);
+    xml.setAttribute("lastOffset", videoOffsetSeconds_.load(std::memory_order_relaxed));
+    xml.setAttribute("lastSmpteRate", static_cast<int>(smpteRate_.load(std::memory_order_relaxed)));
+    xml.setAttribute("lastSyncMode", static_cast<int>(getSyncMode()));
+
+    auto file = getSettingsFile();
+    xml.writeTo(file);
+}
+
+void MScoreVideoSyncProcessor::loadPersistentSettings()
+{
+    auto file = getSettingsFile();
+    if (file.existsAsFile())
+    {
+        auto xml = juce::XmlDocument::parse(file);
+        if (xml && xml->hasTagName("MScoreVideoSyncSettings"))
+        {
+            double offset = xml->getDoubleAttribute("lastOffset", 0.0);
+            videoOffsetSeconds_.store(offset, std::memory_order_release);
+            tempoTracker_.setVideoOffsetSeconds(offset);
+
+            int smpte = xml->getIntAttribute("lastSmpteRate", static_cast<int>(SMPTEFrameRate::FPS_24));
+            smpteRate_.store(static_cast<SMPTEFrameRate>(smpte), std::memory_order_release);
+
+            int mode = xml->getIntAttribute("lastSyncMode", static_cast<int>(SyncMode::DAWPlayHead));
+            tempoTracker_.setSyncMode(static_cast<SyncMode>(mode));
+
+            juce::String videoPath = xml->getStringAttribute("lastVideoPath", "");
+            if (videoPath.isNotEmpty())
+            {
+                juce::File vFile(videoPath);
+                if (vFile.existsAsFile())
+                {
+                    if (decoder_.openFile(vFile))
+                    {
+                        lastLoadedVideoPath_ = vFile.getFullPathName();
+                    }
+                }
+            }
+        }
+    }
+}
+
 void MScoreVideoSyncProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
     juce::ValueTree state("MScoreVideoSyncState");
@@ -177,12 +269,30 @@ void MScoreVideoSyncProcessor::getStateInformation(juce::MemoryBlock& destData)
     state.setProperty("syncMode", static_cast<int>(getSyncMode()), nullptr);
 
     std::unique_ptr<juce::XmlElement> xml(state.createXml());
-    copyXmlToBinary(*xml, destData);
+    if (xml != nullptr)
+    {
+        copyXmlToBinary(*xml, destData);
+    }
 }
 
 void MScoreVideoSyncProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
-    std::unique_ptr<juce::XmlElement> xmlState(getXmlFromBinary(data, sizeInBytes));
+    std::unique_ptr<juce::XmlElement> xmlState;
+
+    if (data != nullptr && sizeInBytes > 0)
+    {
+        xmlState = getXmlFromBinary(data, sizeInBytes);
+        if (xmlState == nullptr)
+        {
+            // Fallback: parse as plain XML text in case host preserved it as text string
+            juce::String xmlText = juce::String::createStringFromData(data, sizeInBytes);
+            if (xmlText.isNotEmpty())
+            {
+                xmlState = juce::XmlDocument::parse(xmlText);
+            }
+        }
+    }
+
     if (xmlState && xmlState->hasTagName("MScoreVideoSyncState"))
     {
         juce::ValueTree state = juce::ValueTree::fromXml(*xmlState);
@@ -208,12 +318,23 @@ void MScoreVideoSyncProcessor::setStateInformation(const void* data, int sizeInB
             }
         }
     }
+    else
+    {
+        // If host provided empty or unrecognized state, fall back to last session settings
+        loadPersistentSettings();
+    }
 }
 
 void MScoreVideoSyncProcessor::setVideoOffset(double offsetSeconds)
 {
     videoOffsetSeconds_.store(offsetSeconds, std::memory_order_release);
     tempoTracker_.setVideoOffsetSeconds(offsetSeconds);
+    if (paramOffset_ != nullptr && std::abs(paramOffset_->get() - static_cast<float>(offsetSeconds)) > 0.0001f)
+    {
+        *paramOffset_ = static_cast<float>(offsetSeconds);
+    }
+    savePersistentSettings();
+    updateHostDisplay(juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
 }
 
 double MScoreVideoSyncProcessor::getVideoOffset() const noexcept
@@ -224,6 +345,12 @@ double MScoreVideoSyncProcessor::getVideoOffset() const noexcept
 void MScoreVideoSyncProcessor::setSMPTEFrameRate(SMPTEFrameRate rate)
 {
     smpteRate_.store(rate, std::memory_order_release);
+    if (paramSmpteRate_ != nullptr && paramSmpteRate_->getIndex() != static_cast<int>(rate))
+    {
+        *paramSmpteRate_ = static_cast<int>(rate);
+    }
+    savePersistentSettings();
+    updateHostDisplay(juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
 }
 
 SMPTEFrameRate MScoreVideoSyncProcessor::getSMPTEFrameRate() const noexcept
@@ -234,6 +361,12 @@ SMPTEFrameRate MScoreVideoSyncProcessor::getSMPTEFrameRate() const noexcept
 void MScoreVideoSyncProcessor::setSyncMode(SyncMode mode)
 {
     tempoTracker_.setSyncMode(mode);
+    if (paramSyncMode_ != nullptr && paramSyncMode_->getIndex() != static_cast<int>(mode))
+    {
+        *paramSyncMode_ = static_cast<int>(mode);
+    }
+    savePersistentSettings();
+    updateHostDisplay(juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
 }
 
 SyncMode MScoreVideoSyncProcessor::getSyncMode() const noexcept
@@ -247,8 +380,18 @@ bool MScoreVideoSyncProcessor::loadVideoFile(const juce::File& file)
     if (success)
     {
         lastLoadedVideoPath_ = file.getFullPathName();
+        savePersistentSettings();
+        updateHostDisplay(juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
     }
     return success;
+}
+
+void MScoreVideoSyncProcessor::closeVideoFile()
+{
+    decoder_.closeFile();
+    lastLoadedVideoPath_ = {};
+    savePersistentSettings();
+    updateHostDisplay(juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
 }
 
 juce::String MScoreVideoSyncProcessor::getLoadedVideoPath() const

@@ -38,6 +38,7 @@ private:
     void openFilePicker();
     void closeCurrentVideo();
     void setupUI();
+    void updateVideoInfoUI();
 
     MScoreVideoSyncProcessor& processor_;
 
@@ -46,6 +47,7 @@ private:
 
     // Top Header Controls
     juce::Label lblTitle_{ "lblTitle", "MScore Video Sync Pro" };
+    juce::Label lblVideoFileName_{ "lblVideoFileName", "" };
     juce::TextButton btnLoadVideo_{ "📂 Load Video..." };
     juce::TextButton btnCloseVideo_{ "✕ Close" };
 

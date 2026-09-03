@@ -181,11 +181,25 @@ void VideoViewport::drawHUD(juce::Graphics& g, const juce::Rectangle<int>& video
     g.drawText(badgeText, hwBadgeRect, juce::Justification::centred);
 
     // Video metadata info
-    juce::String infoText = juce::String::formatted("%dx%d | %.2f fps | %s",
-                                                   metadata.width,
-                                                   metadata.height,
-                                                   metadata.frameRate,
-                                                   metadata.codecName.toRawUTF8());
+    juce::File vFile(metadata.filePath);
+    juce::String fileName = vFile.getFileName();
+    juce::String infoText;
+    if (fileName.isNotEmpty())
+    {
+        infoText = fileName + "  •  " + juce::String::formatted("%dx%d | %.2f fps | %s",
+                                                               metadata.width,
+                                                               metadata.height,
+                                                               metadata.frameRate,
+                                                               metadata.codecName.toRawUTF8());
+    }
+    else
+    {
+        infoText = juce::String::formatted("%dx%d | %.2f fps | %s",
+                                           metadata.width,
+                                           metadata.height,
+                                           metadata.frameRate,
+                                           metadata.codecName.toRawUTF8());
+    }
     g.setColour(juce::Colour::fromRGB(200, 220, 240));
     g.setFont(juce::FontOptions(12.0f));
     g.drawText(infoText, topBar.reduced(10, 0), juce::Justification::centredLeft);

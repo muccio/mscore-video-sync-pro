@@ -22,6 +22,9 @@ PluginEditor::PluginEditor(MScoreVideoSyncProcessor& proc)
 
     // 60Hz refresh timer for smooth video and SMPTE display
     startTimerHz(60);
+
+    // Initial state from processor
+    updateVideoInfoUI();
 }
 
 PluginEditor::~PluginEditor()
@@ -326,7 +329,10 @@ void PluginEditor::filesDropped(const juce::StringArray& files, int /*x*/, int /
     if (!files.isEmpty())
     {
         juce::File file(files[0]);
-        processor_.loadVideoFile(file);
+        if (processor_.loadVideoFile(file))
+        {
+            updateVideoInfoUI();
+        }
     }
 }
 
@@ -343,19 +349,45 @@ void PluginEditor::openFilePicker()
         auto result = chooser.getResult();
         if (result.existsAsFile())
         {
-            processor_.loadVideoFile(result);
+            if (processor_.loadVideoFile(result))
+            {
+                updateVideoInfoUI();
+            }
         }
     });
 }
 
 void PluginEditor::closeCurrentVideo()
 {
-    processor_.getDecoder().closeFile();
+    processor_.closeVideoFile();
+    updateVideoInfoUI();
+}
+
+void PluginEditor::updateVideoInfoUI()
+{
+    if (processor_.getDecoder().isFileLoaded())
+    {
+        juce::File f(processor_.getLoadedVideoPath());
+        lblVideoFileName_.setText(f.getFileName(), juce::dontSendNotification);
+        lblVideoFileName_.setTooltip(processor_.getLoadedVideoPath());
+        btnCloseVideo_.setEnabled(true);
+
+        auto metadata = processor_.getDecoder().getMetadata();
+        double duration = (metadata.durationSeconds > 0.0) ? metadata.durationSeconds : 100.0;
+        sliderTimeline_.setRange(0.0, duration, 0.01);
+    }
+    else
+    {
+        lblVideoFileName_.setText("No video loaded", juce::dontSendNotification);
+        lblVideoFileName_.setTooltip({});
+        btnCloseVideo_.setEnabled(false);
+    }
+    repaint();
 }
 
 void PluginEditor::videoLoaded(const VideoMetadata& /*metadata*/)
 {
-    repaint();
+    updateVideoInfoUI();
 }
 
 void PluginEditor::videoLoadFailed(const juce::String& errorMessage)

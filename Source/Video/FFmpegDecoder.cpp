@@ -163,7 +163,14 @@ bool FFmpegDecoder::openFile(const juce::File& videoFile)
     isHwAccelActive_.store(metadata_.isHardwareAccelerated, std::memory_order_release);
     isLoaded_.store(true, std::memory_order_release);
 
+    // Ensure thread is running
+    if (!isThreadRunning())
+    {
+        startThread(juce::Thread::Priority::high);
+    }
+
     // Decode initial frame at 0.0s
+    lastSeekTargetPts_.store(0.0, std::memory_order_release);
     seekTargetPts_.store(0.0, std::memory_order_release);
     seekRequested_.store(true, std::memory_order_release);
 
@@ -176,6 +183,7 @@ bool FFmpegDecoder::openFile(const juce::File& videoFile)
 void FFmpegDecoder::closeFile()
 {
     isLoaded_.store(false, std::memory_order_release);
+    lastSeekTargetPts_.store(-1.0, std::memory_order_release);
     frameQueue_.clear();
     cleanupFFmpeg();
     metadata_ = VideoMetadata();
@@ -290,13 +298,20 @@ void FFmpegDecoder::setPlaybackState(bool isPlaying, double targetPts)
     // If playback state just started, seek to starting point
     if (!wasPlaying && isPlaying)
     {
+        lastSeekTargetPts_.store(targetPts, std::memory_order_relaxed);
         requestSeek(targetPts);
     }
     else if (!isPlaying)
     {
-        // Paused timeline scrub
-        if (std::abs(delta) > 0.04)
+        // When stopped / paused: only seek if the target position has actually changed
+        // (e.g. note selection in score, user scrubbed timeline, or transport relocated)
+        double lastTarget = lastSeekTargetPts_.load(std::memory_order_relaxed);
+        double frameDuration = (metadata_.frameRate > 0.0) ? (1.0 / metadata_.frameRate) : 0.04;
+        double threshold = std::max(0.015, frameDuration * 0.4);
+
+        if (lastTarget < 0.0 || std::abs(targetPts - lastTarget) >= threshold)
         {
+            lastSeekTargetPts_.store(targetPts, std::memory_order_relaxed);
             requestSeek(targetPts);
         }
     }
@@ -305,6 +320,7 @@ void FFmpegDecoder::setPlaybackState(bool isPlaying, double targetPts)
         // Continuous playback: ONLY seek if user looped or jumped backwards, or jumped far ahead (> 1.5s)
         if (delta < -0.3 || delta > 1.5)
         {
+            lastSeekTargetPts_.store(targetPts, std::memory_order_relaxed);
             requestSeek(targetPts);
         }
         else
@@ -317,7 +333,7 @@ void FFmpegDecoder::setPlaybackState(bool isPlaying, double targetPts)
 void FFmpegDecoder::requestSeek(double targetPts)
 {
     double target = std::max(0.0, targetPts);
-    if (seekRequested_.load(std::memory_order_relaxed) && std::abs(target - seekTargetPts_.load(std::memory_order_relaxed)) < 0.05)
+    if (seekRequested_.load(std::memory_order_relaxed) && std::abs(target - seekTargetPts_.load(std::memory_order_relaxed)) < 0.02)
     {
         return;
     }
@@ -377,11 +393,12 @@ void FFmpegDecoder::run()
 
         if (playing)
         {
+            double frameDuration = (metadata_.frameRate > 0.0) ? (1.0 / metadata_.frameRate) : 0.04;
             // If we are behind target playhead, decode next frame
-            if (current < target + 0.05)
+            if (current + (frameDuration * 0.5) < target)
             {
                 bool eof = false;
-                if (!decodeNextFrame(eof))
+                if (!decodeNextFrame(eof, -1.0))
                 {
                     if (eof)
                     {
@@ -430,7 +447,7 @@ bool FFmpegDecoder::performSeek(double targetSeconds)
         if (seekRequested_.load(std::memory_order_relaxed))
             return false; // Newer seek supersedes this one
 
-        if (!decodeNextFrame(reachedEof))
+        if (!decodeNextFrame(reachedEof, targetSeconds))
         {
             if (reachedEof) break;
             continue;
@@ -446,7 +463,7 @@ bool FFmpegDecoder::performSeek(double targetSeconds)
     return true;
 }
 
-bool FFmpegDecoder::decodeNextFrame(bool& reachedEof)
+bool FFmpegDecoder::decodeNextFrame(bool& reachedEof, double targetCommitPts)
 {
     reachedEof = false;
 
@@ -485,14 +502,20 @@ bool FFmpegDecoder::decodeNextFrame(bool& reachedEof)
 
             currentDecodedPts_.store(ptsSeconds, std::memory_order_release);
 
-            // Write to lock-free frame queue
-            DecodedVideoFrame* writeBuf = frameQueue_.getWriteBuffer();
-            if (writeBuf)
+            double frameDuration = (metadata_.frameRate > 0.0) ? (1.0 / metadata_.frameRate) : 0.04;
+            bool shouldCommit = (targetCommitPts < 0.0) || (ptsSeconds >= targetCommitPts - (frameDuration * 0.5));
+
+            if (shouldCommit)
             {
-                writeBuf->pts = ptsSeconds;
-                writeBuf->duration = (metadata_.frameRate > 0.0) ? (1.0 / metadata_.frameRate) : 0.04;
-                convertFrameToImage(finalFrame, writeBuf);
-                frameQueue_.commitWriteBuffer();
+                // Write to lock-free frame queue
+                DecodedVideoFrame* writeBuf = frameQueue_.getWriteBuffer();
+                if (writeBuf)
+                {
+                    writeBuf->pts = ptsSeconds;
+                    writeBuf->duration = frameDuration;
+                    convertFrameToImage(finalFrame, writeBuf);
+                    frameQueue_.commitWriteBuffer();
+                }
             }
 
             av_frame_unref(hwFrame_);

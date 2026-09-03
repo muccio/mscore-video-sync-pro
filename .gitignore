@@ -27,3 +27,7 @@ compile_commands.json
 *.component
 *.au
 *.app
+
+# Score test files
+*.mscz
+*.mscx

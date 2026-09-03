@@ -36,7 +36,8 @@ void TempoMapTracker::processAudioBlock(const juce::AudioPlayHead* playHead,
     {
         if (auto posInfoOpt = playHead->getPosition())
         {
-            if (posInfoOpt->getIsPlaying())
+            bool isHostPlaying = posInfoOpt->getIsPlaying();
+            if (isHostPlaying)
             {
                 hostIsAdvancing = true;
             }
@@ -67,7 +68,8 @@ void TempoMapTracker::processAudioBlock(const juce::AudioPlayHead* playHead,
             {
                 int64_t currentSamples = *samplesOpt;
                 hostTimeSec = static_cast<double>(currentSamples) / sr;
-                if (lastSamplePosition_ >= 0 && currentSamples != lastSamplePosition_)
+                // Only treat position changes as playback advancement if host is playing or contiguously incrementing
+                if (isHostPlaying || (lastSamplePosition_ >= 0 && currentSamples > lastSamplePosition_ && (currentSamples - lastSamplePosition_) <= numSamples * 2))
                 {
                     hostIsAdvancing = true;
                 }
@@ -77,7 +79,7 @@ void TempoMapTracker::processAudioBlock(const juce::AudioPlayHead* playHead,
             else if (auto secOpt = posInfoOpt->getTimeInSeconds())
             {
                 hostTimeSec = *secOpt;
-                if (lastHostTimeSec_ >= 0.0 && std::abs(hostTimeSec - lastHostTimeSec_) > 0.0001)
+                if (isHostPlaying || (lastHostTimeSec_ >= 0.0 && (hostTimeSec - lastHostTimeSec_) > 0.0001 && (hostTimeSec - lastHostTimeSec_) < 0.2))
                 {
                     hostIsAdvancing = true;
                 }
@@ -91,7 +93,7 @@ void TempoMapTracker::processAudioBlock(const juce::AudioPlayHead* playHead,
                 if (!gotTime)
                 {
                     hostTimeSec = (*ppqOpt * 60.0) / currentBpm;
-                    if (lastHostTimeSec_ >= 0.0 && std::abs(hostTimeSec - lastHostTimeSec_) > 0.0001)
+                    if (isHostPlaying || (lastHostTimeSec_ >= 0.0 && (hostTimeSec - lastHostTimeSec_) > 0.0001 && (hostTimeSec - lastHostTimeSec_) < 0.2))
                     {
                         hostIsAdvancing = true;
                     }
@@ -100,9 +102,13 @@ void TempoMapTracker::processAudioBlock(const juce::AudioPlayHead* playHead,
                 }
             }
 
-            if (hostIsAdvancing)
+            if (isHostPlaying && hostIsAdvancing)
             {
-                activeFramesRemaining_ = 30; // Sustain host position tracking for 30 blocks (~300ms)
+                activeFramesRemaining_ = 30; // Sustain host position tracking for 30 blocks (~300ms) while playing
+            }
+            else
+            {
+                activeFramesRemaining_ = 0; // Stopped / paused / note jump
             }
         }
     }
@@ -179,11 +185,11 @@ void TempoMapTracker::processAudioBlock(const juce::AudioPlayHead* playHead,
     {
         finalPlaying = (activeFramesRemaining_ > 0);
         finalTimeSec = hostTimeSec;
-        selectedSource = 1;
+        selectedSource = finalPlaying ? 1 : 0;
     }
     else if (mode == SyncMode::AudioStream)
     {
-        finalPlaying = true; // Audio blocks actively processing
+        finalPlaying = (activeFramesRemaining_ > 0 || numSamples > 0);
         finalTimeSec = accumulatedSampleTimeSec_;
         selectedSource = 2;
     }
@@ -209,9 +215,10 @@ void TempoMapTracker::processAudioBlock(const juce::AudioPlayHead* playHead,
         }
         else
         {
-            finalPlaying = true; // Audio blocks actively flowing through mixer
-            finalTimeSec = accumulatedSampleTimeSec_;
-            selectedSource = 2; // MuseScore Audio Stream Clock
+            // Stopped / paused
+            finalPlaying = false;
+            finalTimeSec = hostTimeSec;
+            selectedSource = 0;
         }
     }
 
