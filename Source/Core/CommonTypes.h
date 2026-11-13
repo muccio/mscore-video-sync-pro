@@ -7,12 +7,16 @@
 #include <vector>
 #include <cmath>
 #include <cstdint>
+#include <atomic>
 #include <iomanip>
 #include <sstream>
 
 namespace MScoreVideoSync
 {
 
+// ==============================================================================
+// SMPTE Frame Rates (SMPTE 12M standard)
+// ==============================================================================
 enum class SMPTEFrameRate : int
 {
     FPS_23_976 = 0,
@@ -71,6 +75,23 @@ inline bool isDropFrame(SMPTEFrameRate rate) noexcept
     return rate == SMPTEFrameRate::FPS_29_97_DF || rate == SMPTEFrameRate::FPS_59_94_DF;
 }
 
+inline SMPTEFrameRate detectFrameRateFromFps(double fps) noexcept
+{
+    if (fps <= 0.0) return SMPTEFrameRate::FPS_24;
+    if (std::abs(fps - (24000.0 / 1001.0)) < 0.05) return SMPTEFrameRate::FPS_23_976;
+    if (std::abs(fps - 24.0) < 0.05) return SMPTEFrameRate::FPS_24;
+    if (std::abs(fps - 25.0) < 0.05) return SMPTEFrameRate::FPS_25;
+    if (std::abs(fps - (30000.0 / 1001.0)) < 0.05) return SMPTEFrameRate::FPS_29_97_NDF;
+    if (std::abs(fps - 30.0) < 0.05) return SMPTEFrameRate::FPS_30;
+    if (std::abs(fps - 50.0) < 0.05) return SMPTEFrameRate::FPS_50;
+    if (std::abs(fps - (60000.0 / 1001.0)) < 0.05) return SMPTEFrameRate::FPS_59_94_NDF;
+    if (std::abs(fps - 60.0) < 0.05) return SMPTEFrameRate::FPS_60;
+    return SMPTEFrameRate::FPS_24;
+}
+
+// ==============================================================================
+// SMPTE Timecode Representation
+// ==============================================================================
 struct SMPTETimecode
 {
     int hours = 0;
@@ -113,8 +134,6 @@ struct SMPTETimecode
 
         if (tc.dropFrame)
         {
-            // Drop Frame SMPTE calculation (SMPTE 12M-1)
-            // For 29.97 DF: 108,000 frames in 1 hour; drop 2 frames every minute except 10th minute
             int dropFramesPerMin = (rate == SMPTEFrameRate::FPS_59_94_DF) ? 4 : 2;
             int framesPer10Min = (rate == SMPTEFrameRate::FPS_59_94_DF) ? 35964 : 17982;
             int framesPerMin = (rate == SMPTEFrameRate::FPS_59_94_DF) ? 3596 : 1798;
@@ -189,15 +208,34 @@ struct SMPTETimecode
 
         return isNegative ? -totalSec : totalSec;
     }
+
+    static SMPTETimecode parse(const juce::String& text, SMPTEFrameRate rate)
+    {
+        SMPTETimecode tc;
+        auto tokens = juce::StringArray::fromTokens(text.trim(), ":;.", "");
+        if (tokens.size() >= 4)
+        {
+            tc.hours = tokens[0].getIntValue();
+            tc.minutes = tokens[1].getIntValue();
+            tc.seconds = tokens[2].getIntValue();
+            tc.frames = tokens[3].getIntValue();
+            if (tokens.size() >= 5)
+                tc.subframes = tokens[4].getIntValue();
+            tc.dropFrame = isDropFrame(rate);
+        }
+        return tc;
+    }
 };
 
+// ==============================================================================
+// Synchronization Modes
+// ==============================================================================
 enum class SyncMode : int
 {
-    DAWPlayHead = 0, // Default: Host DAW PlayHead & sample tracking (MuseScore 4 projectTimeSamples, Cubase, Logic, Reaper)
-    Auto,            // Automatic best-fit hybrid
-    AudioStream,     // Sample-accurate audio clock: advances PTS when audio blocks stream through mixer
-    MIDIClock,       // MIDI timing clock and song position pointer
-    Manual,          // Internal manual transport only
+    HostLockAutoScrub = 0, // Follows host in Play & Measure clicks; free-scrub in Stop; auto re-lock
+    HostStrict,            // Strict slave to DAW playhead at all times
+    FreeInternal,          // Independent internal transport (Local Play/Stop/Scrub)
+    SatelliteIPCReceiver,  // Remote satellite client receiving telemetry from local shared memory/OSC
     Count
 };
 
@@ -205,16 +243,50 @@ inline const char* getSyncModeLabel(SyncMode mode) noexcept
 {
     switch (mode)
     {
-        case SyncMode::DAWPlayHead: return "DAW PlayHead (Default)";
-        case SyncMode::Auto:        return "Auto (Hybrid)";
-        case SyncMode::AudioStream: return "Audio Stream Clock";
-        case SyncMode::MIDIClock:   return "MIDI Clock / Events";
-        case SyncMode::Manual:      return "Manual Only";
+        case SyncMode::HostLockAutoScrub:   return "Host Lock + Auto Scrub";
+        case SyncMode::HostStrict:          return "Host Strict Lock";
+        case SyncMode::FreeInternal:        return "Free Internal";
+        case SyncMode::SatelliteIPCReceiver: return "Satellite IPC Receiver";
         case SyncMode::Count:
-        default:                    return "DAW PlayHead";
+        default:                            return "Host Lock + Auto Scrub";
     }
 }
 
+// ==============================================================================
+// Shared Memory IPC Structure (alignas(64) for Cache-Line Alignment)
+// ==============================================================================
+constexpr const char* IPC_SHARED_MEMORY_NAME = "/mscore_video_sync_shm";
+constexpr uint32_t IPC_MAGIC_HEADER = 0x4D535653; // 'MSVS'
+constexpr uint32_t IPC_CURRENT_VERSION = 1;
+
+struct alignas(64) MScoreVideoSyncIPCHeader
+{
+    uint32_t magic = IPC_MAGIC_HEADER;
+    uint32_t version = IPC_CURRENT_VERSION;
+    std::atomic<uint64_t> sequenceCounter{ 0 };
+
+    std::atomic<bool> isPlaying{ false };
+    std::atomic<bool> isLooping{ false };
+    std::atomic<double> sampleRate{ 44100.0 };
+    std::atomic<int64_t> timeInSamples{ 0 };
+    std::atomic<double> timeInSeconds{ 0.0 };
+    std::atomic<double> ppqPosition{ 0.0 };
+    std::atomic<double> bpm{ 120.0 };
+    std::atomic<int32_t> timeSigNumerator{ 4 };
+    std::atomic<int32_t> timeSigDenominator{ 4 };
+    std::atomic<int32_t> barCount{ 1 };
+    std::atomic<double> ppqPositionOfLastBarStart{ 0.0 };
+    std::atomic<int64_t> hostTimeNs{ 0 };
+
+    char videoFilePath[512] = { 0 };
+    std::atomic<double> videoOffsetSeconds{ 0.0 };
+    std::atomic<int32_t> smpteRate{ 0 };
+    std::atomic<int32_t> syncMode{ 0 };
+};
+
+// ==============================================================================
+// Transport Snapshot
+// ==============================================================================
 struct TransportSnapshot
 {
     bool isPlaying = false;
@@ -226,21 +298,108 @@ struct TransportSnapshot
     double ppqPosition = 0.0;
     int timeSigNumerator = 4;
     int timeSigDenominator = 4;
+    int bar = 1;
+    double beat = 1.0;
     double sampleRate = 44100.0;
+
+    // Offsets & adjustments
     double videoOffsetSeconds = 0.0;
+    double displayLatencySeconds = 0.0; // -0.5s to +0.5s
+    double smpteStartTimeSeconds = 0.0; // e.g. 01:00:00:00 video start time
+    double movieStartOffsetSeconds = 0.0; // Bar/Beat anchor offset
 
-    SyncMode syncMode = SyncMode::DAWPlayHead;
-    juce::String activeSource = "None";
-    float audioLevel = 0.0f;
-    bool midiActive = false;
+    SyncMode syncMode = SyncMode::HostLockAutoScrub;
+    bool isLockedToHost = true;
+    juce::String activeSource = "MuseScore 4";
 
-    // Derived target video presentation timestamp (PTS) in seconds
+    // Target video presentation timestamp (PTS) in seconds
     double getTargetVideoPts() const noexcept
     {
-        return std::max(0.0, timeInSeconds + videoOffsetSeconds);
+        double pts = timeInSeconds + videoOffsetSeconds + movieStartOffsetSeconds + displayLatencySeconds;
+        return std::max(0.0, pts);
     }
 };
 
+// ==============================================================================
+// Marker & Cue Types (VEP 8 Visual Cueing Engine)
+// ==============================================================================
+enum class MarkerAnchorType : int
+{
+    TimecodeLocked = 0, // Anchored to SMPTE timecode (fixed video frame)
+    MusicalLocked        // Anchored to Musical Bar | Beat (follows tempo map / BPM)
+};
+
+enum class StreamerDurationType : int
+{
+    Seconds = 0, // Fixed time duration (1.0s, 1.5s, 2.0s, 3.0s)
+    MusicalBeats // Musical duration (1 Bar, 2 Bars, 1 Beat, 2 Beats)
+};
+
+struct CueMarker
+{
+    int id = 0;
+    juce::String name = "Marker";
+    MarkerAnchorType anchorType = MarkerAnchorType::TimecodeLocked;
+
+    // Timecode anchor (SMPTE / Video PTS)
+    double timeSeconds = 0.0;
+
+    // Musical anchor
+    double ppqPosition = 0.0;
+    int bar = 1;
+    double beat = 1.0;
+
+    juce::Colour color = juce::Colour::fromRGB(0, 210, 255); // Cyan default
+
+    // Streamer settings (moving vertical preparation line)
+    bool streamerEnabled = true;
+    StreamerDurationType streamerDurationType = StreamerDurationType::Seconds;
+    double streamerDurationSeconds = 2.0; // 2 seconds default
+    double streamerDurationBeats = 4.0;   // 1 Bar in 4/4 default
+    float streamerWidth = 6.0f;
+    float streamerOpacity = 0.95f;
+    bool streamerGlow = true;
+    bool streamerTopBar = true;
+
+    // Punch settings (visual hit flash)
+    bool punchEnabled = true;
+    int punchFrameDuration = 2; // 1-6 frames
+    juce::Colour punchColor = juce::Colour::fromRGB(255, 255, 255); // White flash
+    float punchRadius = 48.0f;
+    bool punchRingOnly = false;
+
+    // Flutter settings (rapid warning flashes)
+    bool flutterEnabled = false;
+    int flutterFlashCount = 5; // 3, 5, or 7 flashes
+
+    // Audio cue (1000 Hz sine burst 2-Pop click)
+    bool twoPopAudioEnabled = false;
+
+    // Dynamic resolution based on tempo
+    double getEffectivePts(double bpm, int /*timeSigNum*/ = 4) const noexcept
+    {
+        if (anchorType == MarkerAnchorType::TimecodeLocked)
+            return timeSeconds;
+
+        if (bpm <= 0.0) bpm = 120.0;
+        return (ppqPosition * 60.0) / bpm;
+    }
+
+    double getStreamerStartPts(double effectivePts, double bpm) const noexcept
+    {
+        double durationSec = streamerDurationSeconds;
+        if (streamerDurationType == StreamerDurationType::MusicalBeats)
+        {
+            if (bpm <= 0.0) bpm = 120.0;
+            durationSec = (streamerDurationBeats * 60.0) / bpm;
+        }
+        return std::max(0.0, effectivePts - durationSec);
+    }
+};
+
+// ==============================================================================
+// Video File Metadata
+// ==============================================================================
 struct VideoMetadata
 {
     bool isValid = false;
@@ -253,10 +412,41 @@ struct VideoMetadata
     bool isHardwareAccelerated = false;
     juce::String pixelFormatName;
 
+    // Audio stream in video
+    bool hasAudioStream = false;
+    int audioSampleRate = 48000;
+    int audioChannels = 2;
+    juce::String audioCodecName;
+
     double getAspectRatio() const noexcept
     {
         return (height > 0) ? (static_cast<double>(width) / static_cast<double>(height)) : (16.0 / 9.0);
     }
+};
+
+// ==============================================================================
+// Aspect Ratio Presets
+// ==============================================================================
+enum class AspectRatioMode : int
+{
+    Native = 0,
+    Ratio_16_9,
+    Ratio_2_39_1, // Anamorphic Cinemascope
+    Ratio_1_85_1, // DCI / Theatrical Flat
+    Ratio_4_3,
+    FillStretch
+};
+
+// ==============================================================================
+// Zoom Presets
+// ==============================================================================
+enum class VideoZoomPreset : int
+{
+    FitToScreen = 0,
+    Zoom_50,
+    Zoom_100,
+    Zoom_150,
+    Zoom_200
 };
 
 } // namespace MScoreVideoSync

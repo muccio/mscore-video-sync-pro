@@ -72,9 +72,18 @@ if [[ -d "${BUNDLE_PATH}" ]]; then
         lipo -info "${BINARY_PATH}"
     fi
 
+    STANDALONE_PATH="${BUILD_DIR}/MScoreVideoSyncPro_artefacts/Release/Standalone/MScore Video Sync Pro.app"
+    AU_PATH="${BUILD_DIR}/MScoreVideoSyncPro_artefacts/Release/AU/MScore Video Sync Pro.component"
+
     echo "============================================================"
-    echo "  SUCCESS! MScore Video Sync Pro installed."
-    echo "  Location: ${VST3_DEST}/MScore Video Sync Pro.vst3"
+    echo "  SUCCESS! MScore Video Sync Pro built."
+    echo "  VST3:       ${VST3_DEST}/MScore Video Sync Pro.vst3"
+    if [[ -d "${AU_PATH}" ]]; then
+        echo "  AU:         ${AU_PATH}"
+    fi
+    if [[ -d "${STANDALONE_PATH}" ]]; then
+        echo "  Standalone: ${STANDALONE_PATH}"
+    fi
     echo "============================================================"
 else
     echo "[-] Error: Output bundle not found at ${BUNDLE_PATH}"

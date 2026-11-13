@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 
 project(MScoreVideoSyncPro
     VERSION 1.0.0
-    DESCRIPTION "Ultra-Low-Latency Video Score Player for MuseScore 4"
+    DESCRIPTION "Vienna Ensemble Pro 8 Architecture Video Score Player for MuseScore 4"
     LANGUAGES C CXX OBJC OBJCXX
 )
 
@@ -18,7 +18,6 @@ if(APPLE)
     endif()
 
     if(NOT CMAKE_OSX_ARCHITECTURES)
-        # Default to native architecture; user can pass -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" for Universal Binary
         set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "Target architectures" FORCE)
     endif()
 endif()
@@ -49,11 +48,10 @@ find_package(PkgConfig QUIET)
 set(FFMPEG_FOUND FALSE)
 
 if(PKG_CONFIG_FOUND)
-    # Search Homebrew paths for pkg-config .pc files
     list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew" "/usr/local")
     set(ENV{PKG_CONFIG_PATH} "/opt/homebrew/lib/pkgconfig:/usr/local/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
     
-    pkg_check_modules(FFMPEG IMPORTED_TARGET libavcodec libavformat libswscale libavutil)
+    pkg_check_modules(FFMPEG IMPORTED_TARGET libavcodec libavformat libswscale libavutil libswresample)
     if(FFMPEG_FOUND)
         message(STATUS "Found FFmpeg via pkg-config: ${FFMPEG_LIBRARIES}")
     endif()
@@ -69,8 +67,9 @@ if(NOT FFMPEG_FOUND)
     find_library(AVFORMAT_LIB avformat PATHS /opt/homebrew/lib /usr/local/lib /opt/homebrew/Cellar/ffmpeg/*/lib)
     find_library(SWSCALE_LIB swscale PATHS /opt/homebrew/lib /usr/local/lib /opt/homebrew/Cellar/ffmpeg/*/lib)
     find_library(AVUTIL_LIB avutil PATHS /opt/homebrew/lib /usr/local/lib /opt/homebrew/Cellar/ffmpeg/*/lib)
+    find_library(SWRESAMPLE_LIB swresample PATHS /opt/homebrew/lib /usr/local/lib /opt/homebrew/Cellar/ffmpeg/*/lib)
 
-    if(AVCODEC_INCLUDE_DIR AND AVCODEC_LIB AND AVFORMAT_LIB AND SWSCALE_LIB AND AVUTIL_LIB)
+    if(AVCODEC_INCLUDE_DIR AND AVCODEC_LIB AND AVFORMAT_LIB AND SWSCALE_LIB AND AVUTIL_LIB AND SWRESAMPLE_LIB)
         set(FFMPEG_FOUND TRUE)
         add_library(FFmpeg::FFmpeg INTERFACE IMPORTED)
         target_include_directories(FFmpeg::FFmpeg INTERFACE ${AVCODEC_INCLUDE_DIR})
@@ -79,6 +78,7 @@ if(NOT FFMPEG_FOUND)
             ${AVFORMAT_LIB}
             ${SWSCALE_LIB}
             ${AVUTIL_LIB}
+            ${SWRESAMPLE_LIB}
         )
         message(STATUS "Found FFmpeg manually: ${AVCODEC_LIB}")
     else()
@@ -98,7 +98,7 @@ if(APPLE)
 endif()
 
 # ==============================================================================
-# Plugin Target Definition
+# Plugin & Standalone Targets Definition
 # ==============================================================================
 juce_add_plugin(MScoreVideoSyncPro
     COMPANY_NAME "MScoreTools"
@@ -107,10 +107,10 @@ juce_add_plugin(MScoreVideoSyncPro
     NEEDS_MIDI_OUTPUT FALSE
     IS_MIDI_EFFECT FALSE
     PLUGIN_NAME "MScore Video Sync Pro"
-    PLUGIN_DESCRIPTION "Ultra-Low-Latency Video Score Player for MuseScore 4"
+    PLUGIN_DESCRIPTION "Vienna Ensemble Pro 8 Architecture Video Score Player for MuseScore 4"
     PLUGIN_MANUFACTURER_CODE MscT
     PLUGIN_CODE MsVs
-    FORMATS VST3 AU VST3_MANIFEST_METADATA
+    FORMATS VST3 AU Standalone VST3_MANIFEST_METADATA
     PRODUCT_NAME "MScore Video Sync Pro"
     VST3_CATEGORIES "Tools" "Fx"
     BUNDLE_ID "com.mscoretools.videosyncpro"
@@ -121,15 +121,47 @@ juce_generate_juce_header(MScoreVideoSyncPro)
 # Source files
 target_sources(MScoreVideoSyncPro PRIVATE
     Source/Core/CommonTypes.h
-    Source/Core/TempoMapTracker.h
-    Source/Core/TempoMapTracker.cpp
+    Source/Core/ProjectState.h
+    Source/Core/ProjectState.cpp
     Source/Core/PluginProcessor.h
     Source/Core/PluginProcessor.cpp
+
+    Source/Sync/TransportSyncEngine.h
+    Source/Sync/TransportSyncEngine.cpp
+    Source/Sync/SharedMemoryIPC.h
+    Source/Sync/SharedMemoryIPC.cpp
+    Source/Sync/NetworkBridge.h
+    Source/Sync/NetworkBridge.cpp
+
     Source/Video/LockFreeFrameQueue.h
-    Source/Video/FFmpegDecoder.h
-    Source/Video/FFmpegDecoder.cpp
-    Source/UI/VideoViewport.h
-    Source/UI/VideoViewport.cpp
+    Source/Video/VideoDecodeEngine.h
+    Source/Video/VideoDecodeEngine.cpp
+    Source/Video/FilmstripGenerator.h
+    Source/Video/FilmstripGenerator.cpp
+    Source/Video/WaveformExtractor.h
+    Source/Video/WaveformExtractor.cpp
+
+    Source/Audio/EmbeddedAudioPlayer.h
+    Source/Audio/EmbeddedAudioPlayer.cpp
+    Source/Audio/TwoPopGenerator.h
+    Source/Audio/TwoPopGenerator.cpp
+
+    Source/Cues/CueMarkerModel.h
+    Source/Cues/CueMarkerModel.cpp
+    Source/Cues/MidiMarkerImporter.h
+    Source/Cues/MidiMarkerImporter.cpp
+
+    Source/UI/Theme/Vep8Theme.h
+    Source/UI/Viewport/OverlayRenderer.h
+    Source/UI/Viewport/OverlayRenderer.cpp
+    Source/UI/Viewport/VideoViewport.h
+    Source/UI/Viewport/VideoViewport.cpp
+    Source/UI/Window/FloatingVideoWindow.h
+    Source/UI/Window/FloatingVideoWindow.cpp
+    Source/UI/Timeline/TimelineComponent.h
+    Source/UI/Timeline/TimelineComponent.cpp
+    Source/UI/Inspector/MarkerInspector.h
+    Source/UI/Inspector/MarkerInspector.cpp
     Source/UI/PluginEditor.h
     Source/UI/PluginEditor.cpp
 )
@@ -137,8 +169,16 @@ target_sources(MScoreVideoSyncPro PRIVATE
 target_include_directories(MScoreVideoSyncPro PRIVATE
     Source
     Source/Core
+    Source/Sync
     Source/Video
+    Source/Audio
+    Source/Cues
     Source/UI
+    Source/UI/Theme
+    Source/UI/Viewport
+    Source/UI/Window
+    Source/UI/Timeline
+    Source/UI/Inspector
 )
 
 target_compile_definitions(MScoreVideoSyncPro PRIVATE
@@ -154,6 +194,8 @@ target_link_libraries(MScoreVideoSyncPro PRIVATE
     juce::juce_audio_processors
     juce::juce_gui_extra
     juce::juce_opengl
+    juce::juce_osc
+    juce::juce_dsp
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags

@@ -9,7 +9,6 @@ MScoreVideoSyncProcessor::MScoreVideoSyncProcessor()
                      .withInput("Input", juce::AudioChannelSet::stereo(), true)
                      .withOutput("Output", juce::AudioChannelSet::stereo(), true))
 {
-    // Register parameters for VST3 automation and dirty-state tracking
     addParameter(paramOffset_ = new juce::AudioParameterFloat(
         juce::ParameterID("videoOffset", 1),
         "Video Offset",
@@ -35,14 +34,24 @@ MScoreVideoSyncProcessor::MScoreVideoSyncProcessor()
         juce::ParameterID("syncMode", 1),
         "Sync Mode",
         syncNames,
-        static_cast<int>(SyncMode::DAWPlayHead)));
+        static_cast<int>(SyncMode::HostLockAutoScrub)));
 
-    // Load persistent settings fallback
+    // Start local IPC shared memory producer
+    ipc_.startProducer();
+
+    // Start network OSC bridge
+    networkBridge_.setCommandListener(this);
+    networkBridge_.startBroadcaster("127.0.0.1", 9000);
+    networkBridge_.startReceiver(9001);
+
     loadPersistentSettings();
 }
 
 MScoreVideoSyncProcessor::~MScoreVideoSyncProcessor()
 {
+    networkBridge_.stopBridge();
+    ipc_.close();
+    floatingWindow_ = nullptr;
 }
 
 const juce::String MScoreVideoSyncProcessor::getName() const
@@ -93,9 +102,12 @@ void MScoreVideoSyncProcessor::changeProgramName(int /*index*/, const juce::Stri
 {
 }
 
-void MScoreVideoSyncProcessor::prepareToPlay(double /*sampleRate*/, int /*samplesPerBlock*/)
+void MScoreVideoSyncProcessor::prepareToPlay(double sampleRate, int /*samplesPerBlock*/)
 {
-    tempoTracker_.resetInternalClock();
+    syncEngine_.setScoreTempoBpm(120.0);
+    audioPlayer_.prepareToPlay(sampleRate);
+    twoPopGen_.prepare(sampleRate);
+
     if (!decoder_.isThreadRunning())
     {
         decoder_.startThread(juce::Thread::Priority::high);
@@ -104,9 +116,7 @@ void MScoreVideoSyncProcessor::prepareToPlay(double /*sampleRate*/, int /*sample
 
 void MScoreVideoSyncProcessor::releaseResources()
 {
-    // Note: Do NOT stop decoder_ thread here.
-    // Video decoding thread must remain active while audio engine is paused or idle
-    // so scrubbing, note selection, and UI rendering continue to work.
+    // Threads remain active so scrubbing, score navigation, and floating window continue working
 }
 
 bool MScoreVideoSyncProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
@@ -128,68 +138,102 @@ bool MScoreVideoSyncProcessor::isBusesLayoutSupported(const BusesLayout& layouts
     return true;
 }
 
-void MScoreVideoSyncProcessor::requestHostLocate(double timeSeconds)
+void MScoreVideoSyncProcessor::showFloatingWindow(bool show)
 {
-    pendingMidiLocateTime_.store(timeSeconds, std::memory_order_release);
-    decoder_.requestSeek(tempoTracker_.calculateTargetPts(timeSeconds));
+    if (show)
+    {
+        if (floatingWindow_ == nullptr)
+        {
+            floatingWindow_ = std::make_unique<FloatingVideoWindow>("MScore Video Pro - Secondary Viewport", decoder_, markerModel_);
+        }
+        floatingWindow_->setVisible(true);
+        floatingWindow_->toFront(true);
+    }
+    else
+    {
+        if (floatingWindow_ != nullptr)
+        {
+            floatingWindow_->setVisible(false);
+        }
+    }
+}
+
+bool MScoreVideoSyncProcessor::isFloatingWindowVisible() const
+{
+    return floatingWindow_ != nullptr && floatingWindow_->isVisible();
+}
+
+template <typename FloatType>
+void MScoreVideoSyncProcessor::processBlockInternal(juce::AudioBuffer<FloatType>& buffer, juce::MidiBuffer& midiMessages)
+{
+    // 1. Update Transport Engine (Zero alloc, Zero locks)
+    syncEngine_.processAudioBlock(getPlayHead(), buffer, midiMessages, getSampleRate());
+    auto snapshot = syncEngine_.getSnapshot();
+
+    // 2. Transmit MIDI locate if requested
+    double locateTime = pendingMidiLocateTime_.exchange(-1.0, std::memory_order_acq_rel);
+    if (locateTime >= 0.0)
+    {
+        double bpm = syncEngine_.getScoreTempoBpm();
+        double ppq = (locateTime * bpm) / 60.0;
+        int midiBeats = static_cast<int>(std::round(ppq * 4.0));
+        int lsb = midiBeats & 0x7F;
+        int msb = (midiBeats >> 7) & 0x7F;
+        midiMessages.addEvent(juce::MidiMessage(0xF2, lsb, msb), 0);
+    }
+
+    double currentPts = snapshot.getTargetVideoPts();
+    double lastPts = lastProcessedPts_.load(std::memory_order_relaxed);
+
+    // 3. Trigger 2-Pop audio cue clicks on hit frames
+    if (snapshot.isPlaying && lastPts >= 0.0 && currentPts > lastPts && (currentPts - lastPts) < 1.0)
+    {
+        auto markers = markerModel_.getMarkersSorted();
+        for (const auto& m : markers)
+        {
+            if (m.twoPopAudioEnabled)
+            {
+                double hitPts = m.getEffectivePts(snapshot.bpm, 4);
+                if (hitPts >= lastPts && hitPts < currentPts)
+                {
+                    twoPopGen_.trigger(0.041666);
+                }
+            }
+        }
+    }
+    lastProcessedPts_.store(currentPts, std::memory_order_relaxed);
+
+    // 4. Mix embedded audio stream into plugin output
+    audioPlayer_.processBlockAdding(buffer, buffer.getNumSamples());
+
+    // 5. Mix audible 2-Pop cue synth
+    twoPopGen_.processAdding(buffer, buffer.getNumSamples());
+
+    // 6. Push state to Video Engine
+    decoder_.setPlaybackState(snapshot.isPlaying, currentPts);
+    audioPlayer_.setPlaybackState(snapshot.isPlaying, currentPts);
+
+    // 7. Write to Local Shared Memory IPC for Standalone/Satellite
+    ipc_.writeProducerState(snapshot, lastLoadedVideoPath_, smpteRate_.load(std::memory_order_relaxed), syncEngine_.getSyncMode());
+
+    // 8. Update network bridge telemetry
+    networkBridge_.updateTelemetry(snapshot);
+
+    // 9. Update floating window if open
+    if (floatingWindow_ && floatingWindow_->isVisible())
+    {
+        floatingWindow_->updateSnapshot(snapshot, smpteRate_.load(std::memory_order_relaxed));
+    }
 }
 
 void MScoreVideoSyncProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
 {
-    // Real-Time Audio Thread Safety: No heap allocations, no locks, no Obj-C ARC overhead
-    tempoTracker_.processAudioBlock(getPlayHead(), buffer, midiMessages, getSampleRate());
-
-    // Send MIDI Locate / SPP / MMC if requested
-    double locateTime = pendingMidiLocateTime_.exchange(-1.0, std::memory_order_acq_rel);
-    if (locateTime >= 0.0)
-    {
-        double bpm = tempoTracker_.getScoreTempoBpm();
-        double ppq = (locateTime * bpm) / 60.0;
-        int midiBeats = static_cast<int>(std::round(ppq * 4.0));
-        int lsb = midiBeats & 0x7F;
-        int msb = (midiBeats >> 7) & 0x7F;
-        midiMessages.addEvent(juce::MidiMessage(0xF2, lsb, msb), 0);
-
-        int hr = static_cast<int>(locateTime / 3600.0) % 24;
-        int mn = static_cast<int>(locateTime / 60.0) % 60;
-        int sc = static_cast<int>(locateTime) % 60;
-        double frac = locateTime - std::floor(locateTime);
-        int fr = static_cast<int>(frac * 24.0);
-        int ff = static_cast<int>((frac * 24.0 - fr) * 100.0);
-
-        uint8_t mmcData[] = {
-            0xF0, 0x7F, 0x7F, 0x06, 0x44, 0x06, 0x01,
-            static_cast<uint8_t>(hr),
-            static_cast<uint8_t>(mn),
-            static_cast<uint8_t>(sc),
-            static_cast<uint8_t>(fr),
-            static_cast<uint8_t>(ff),
-            0xF7
-        };
-        midiMessages.addEvent(juce::MidiMessage(mmcData, sizeof(mmcData)), 0);
-    }
-
-    auto snapshot = tempoTracker_.getSnapshot();
-    decoder_.setPlaybackState(snapshot.isPlaying, snapshot.getTargetVideoPts());
+    processBlockInternal(buffer, midiMessages);
 }
 
 void MScoreVideoSyncProcessor::processBlock(juce::AudioBuffer<double>& buffer, juce::MidiBuffer& midiMessages)
 {
-    tempoTracker_.processAudioBlock(getPlayHead(), buffer, midiMessages, getSampleRate());
-
-    double locateTime = pendingMidiLocateTime_.exchange(-1.0, std::memory_order_acq_rel);
-    if (locateTime >= 0.0)
-    {
-        double bpm = tempoTracker_.getScoreTempoBpm();
-        double ppq = (locateTime * bpm) / 60.0;
-        int midiBeats = static_cast<int>(std::round(ppq * 4.0));
-        int lsb = midiBeats & 0x7F;
-        int msb = (midiBeats >> 7) & 0x7F;
-        midiMessages.addEvent(juce::MidiMessage(0xF2, lsb, msb), 0);
-    }
-
-    auto snapshot = tempoTracker_.getSnapshot();
-    decoder_.setPlaybackState(snapshot.isPlaying, snapshot.getTargetVideoPts());
+    processBlockInternal(buffer, midiMessages);
 }
 
 bool MScoreVideoSyncProcessor::hasEditor() const
@@ -202,133 +246,69 @@ juce::AudioProcessorEditor* MScoreVideoSyncProcessor::createEditor()
     return new PluginEditor(*this);
 }
 
-static juce::File getSettingsFile()
+void MScoreVideoSyncProcessor::requestHostLocate(double timeSeconds)
 {
-    auto dir = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
-                   .getChildFile("MScoreVideoSyncPro");
-    if (!dir.exists())
-    {
-        dir.createDirectory();
-    }
-    return dir.getChildFile("settings.xml");
+    pendingMidiLocateTime_.store(timeSeconds, std::memory_order_release);
+    decoder_.requestSeek(timeSeconds);
+    audioPlayer_.requestSeek(timeSeconds);
 }
 
-void MScoreVideoSyncProcessor::savePersistentSettings()
+void MScoreVideoSyncProcessor::onRemotePlay()
 {
-    juce::XmlElement xml("MScoreVideoSyncSettings");
-    xml.setAttribute("lastVideoPath", lastLoadedVideoPath_);
-    xml.setAttribute("lastOffset", videoOffsetSeconds_.load(std::memory_order_relaxed));
-    xml.setAttribute("lastSmpteRate", static_cast<int>(smpteRate_.load(std::memory_order_relaxed)));
-    xml.setAttribute("lastSyncMode", static_cast<int>(getSyncMode()));
-
-    auto file = getSettingsFile();
-    xml.writeTo(file);
+    syncEngine_.setLocalPlaying(true);
 }
 
-void MScoreVideoSyncProcessor::loadPersistentSettings()
+void MScoreVideoSyncProcessor::onRemotePause()
 {
-    auto file = getSettingsFile();
-    if (file.existsAsFile())
-    {
-        auto xml = juce::XmlDocument::parse(file);
-        if (xml && xml->hasTagName("MScoreVideoSyncSettings"))
-        {
-            double offset = xml->getDoubleAttribute("lastOffset", 0.0);
-            videoOffsetSeconds_.store(offset, std::memory_order_release);
-            tempoTracker_.setVideoOffsetSeconds(offset);
-
-            int smpte = xml->getIntAttribute("lastSmpteRate", static_cast<int>(SMPTEFrameRate::FPS_24));
-            smpteRate_.store(static_cast<SMPTEFrameRate>(smpte), std::memory_order_release);
-
-            int mode = xml->getIntAttribute("lastSyncMode", static_cast<int>(SyncMode::DAWPlayHead));
-            tempoTracker_.setSyncMode(static_cast<SyncMode>(mode));
-
-            juce::String videoPath = xml->getStringAttribute("lastVideoPath", "");
-            if (videoPath.isNotEmpty())
-            {
-                juce::File vFile(videoPath);
-                if (vFile.existsAsFile())
-                {
-                    if (decoder_.openFile(vFile))
-                    {
-                        lastLoadedVideoPath_ = vFile.getFullPathName();
-                    }
-                }
-            }
-        }
-    }
+    syncEngine_.setLocalPlaying(false);
 }
 
-void MScoreVideoSyncProcessor::getStateInformation(juce::MemoryBlock& destData)
+void MScoreVideoSyncProcessor::onRemoteStop()
 {
-    juce::ValueTree state("MScoreVideoSyncState");
-
-    state.setProperty("videoFilePath", lastLoadedVideoPath_, nullptr);
-    state.setProperty("videoOffsetSeconds", videoOffsetSeconds_.load(std::memory_order_relaxed), nullptr);
-    state.setProperty("smpteRate", static_cast<int>(smpteRate_.load(std::memory_order_relaxed)), nullptr);
-    state.setProperty("syncMode", static_cast<int>(getSyncMode()), nullptr);
-
-    std::unique_ptr<juce::XmlElement> xml(state.createXml());
-    if (xml != nullptr)
-    {
-        copyXmlToBinary(*xml, destData);
-    }
+    syncEngine_.setLocalPlaying(false);
 }
 
-void MScoreVideoSyncProcessor::setStateInformation(const void* data, int sizeInBytes)
+void MScoreVideoSyncProcessor::onRemoteLocate(double timeSeconds)
 {
-    std::unique_ptr<juce::XmlElement> xmlState;
+    requestHostLocate(timeSeconds);
+}
 
-    if (data != nullptr && sizeInBytes > 0)
+bool MScoreVideoSyncProcessor::loadVideoFile(const juce::File& file)
+{
+    bool videoOk = decoder_.openFile(file);
+    if (videoOk)
     {
-        xmlState = getXmlFromBinary(data, sizeInBytes);
-        if (xmlState == nullptr)
-        {
-            // Fallback: parse as plain XML text in case host preserved it as text string
-            juce::String xmlText = juce::String::createStringFromData(data, sizeInBytes);
-            if (xmlText.isNotEmpty())
-            {
-                xmlState = juce::XmlDocument::parse(xmlText);
-            }
-        }
+        audioPlayer_.openFile(file, getSampleRate());
+
+        auto meta = decoder_.getMetadata();
+        SMPTEFrameRate detected = detectFrameRateFromFps(meta.frameRate);
+        setSMPTEFrameRate(detected);
+
+        lastLoadedVideoPath_ = file.getFullPathName();
+        savePersistentSettings();
+        updateHostDisplay(juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
     }
+    return videoOk;
+}
 
-    if (xmlState && xmlState->hasTagName("MScoreVideoSyncState"))
-    {
-        juce::ValueTree state = juce::ValueTree::fromXml(*xmlState);
-        if (state.isValid())
-        {
-            double offset = static_cast<double>(state.getProperty("videoOffsetSeconds", 0.0));
-            setVideoOffset(offset);
+void MScoreVideoSyncProcessor::closeVideoFile()
+{
+    decoder_.closeFile();
+    audioPlayer_.closeFile();
+    lastLoadedVideoPath_ = {};
+    savePersistentSettings();
+    updateHostDisplay(juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
+}
 
-            int rateInt = static_cast<int>(state.getProperty("smpteRate", static_cast<int>(SMPTEFrameRate::FPS_24)));
-            setSMPTEFrameRate(static_cast<SMPTEFrameRate>(rateInt));
-
-            int modeInt = static_cast<int>(state.getProperty("syncMode", static_cast<int>(SyncMode::DAWPlayHead)));
-            setSyncMode(static_cast<SyncMode>(modeInt));
-
-            juce::String videoPath = state.getProperty("videoFilePath", "").toString();
-            if (videoPath.isNotEmpty())
-            {
-                juce::File file(videoPath);
-                if (file.existsAsFile())
-                {
-                    loadVideoFile(file);
-                }
-            }
-        }
-    }
-    else
-    {
-        // If host provided empty or unrecognized state, fall back to last session settings
-        loadPersistentSettings();
-    }
+juce::String MScoreVideoSyncProcessor::getLoadedVideoPath() const
+{
+    return lastLoadedVideoPath_;
 }
 
 void MScoreVideoSyncProcessor::setVideoOffset(double offsetSeconds)
 {
     videoOffsetSeconds_.store(offsetSeconds, std::memory_order_release);
-    tempoTracker_.setVideoOffsetSeconds(offsetSeconds);
+    syncEngine_.setVideoOffsetSeconds(offsetSeconds);
     if (paramOffset_ != nullptr && std::abs(paramOffset_->get() - static_cast<float>(offsetSeconds)) > 0.0001f)
     {
         *paramOffset_ = static_cast<float>(offsetSeconds);
@@ -360,7 +340,7 @@ SMPTEFrameRate MScoreVideoSyncProcessor::getSMPTEFrameRate() const noexcept
 
 void MScoreVideoSyncProcessor::setSyncMode(SyncMode mode)
 {
-    tempoTracker_.setSyncMode(mode);
+    syncEngine_.setSyncMode(mode);
     if (paramSyncMode_ != nullptr && paramSyncMode_->getIndex() != static_cast<int>(mode))
     {
         *paramSyncMode_ = static_cast<int>(mode);
@@ -371,37 +351,197 @@ void MScoreVideoSyncProcessor::setSyncMode(SyncMode mode)
 
 SyncMode MScoreVideoSyncProcessor::getSyncMode() const noexcept
 {
-    return tempoTracker_.getSyncMode();
+    return syncEngine_.getSyncMode();
 }
 
-bool MScoreVideoSyncProcessor::loadVideoFile(const juce::File& file)
+static juce::File getSettingsFile()
 {
-    bool success = decoder_.openFile(file);
-    if (success)
+    auto dir = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                   .getChildFile("MScoreVideoSyncPro");
+    if (!dir.exists()) dir.createDirectory();
+    return dir.getChildFile("settings.json");
+}
+
+void MScoreVideoSyncProcessor::savePersistentSettings()
+{
+    SerializedPluginState state;
+    state.videoFilePath = lastLoadedVideoPath_;
+    state.videoOffsetSeconds = videoOffsetSeconds_.load(std::memory_order_relaxed);
+    state.smpteStartTimeSeconds = syncEngine_.getSmpteStartTime();
+    state.movieStartOffsetSeconds = syncEngine_.getMovieStartOffset();
+    state.displayLatencySeconds = syncEngine_.getDisplayLatencyCompensation();
+    state.trimInSeconds = syncEngine_.getTrimInSeconds();
+    state.trimOutSeconds = syncEngine_.getTrimOutSeconds();
+    state.smpteRate = static_cast<int>(smpteRate_.load(std::memory_order_relaxed));
+    state.syncMode = static_cast<int>(syncEngine_.getSyncMode());
+
+    state.audioGainDb = audioPlayer_.getGainDecibels();
+    state.isAudioMuted = audioPlayer_.isMuted();
+    state.isAudioDimmed = audioPlayer_.isDimmed();
+
+    state.isFloatingWindowVisible = isFloatingWindowVisible();
+    if (floatingWindow_)
     {
-        lastLoadedVideoPath_ = file.getFullPathName();
-        savePersistentSettings();
-        updateHostDisplay(juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
+        state.floatingWindowGeometry = floatingWindow_->getWindowGeometryString();
+        state.isAlwaysOnTop = floatingWindow_->isAlwaysOnTopActive();
+        state.isBorderless = floatingWindow_->isBorderlessActive();
+        state.isClickThrough = floatingWindow_->isClickThroughActive();
     }
-    return success;
+
+    state.markersJson = markerModel_.exportToJson();
+
+    ProjectStateSerializer::saveToMvspFile(getSettingsFile(), state);
 }
 
-void MScoreVideoSyncProcessor::closeVideoFile()
+void MScoreVideoSyncProcessor::loadPersistentSettings()
 {
-    decoder_.closeFile();
-    lastLoadedVideoPath_ = {};
-    savePersistentSettings();
-    updateHostDisplay(juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
+    SerializedPluginState state;
+    if (ProjectStateSerializer::loadFromMvspFile(getSettingsFile(), state))
+    {
+        setVideoOffset(state.videoOffsetSeconds);
+        syncEngine_.setSmpteStartTime(state.smpteStartTimeSeconds);
+        syncEngine_.setMovieStartOffset(state.movieStartOffsetSeconds);
+        syncEngine_.setDisplayLatencyCompensation(state.displayLatencySeconds);
+        syncEngine_.setTrimRange(state.trimInSeconds, state.trimOutSeconds);
+
+        setSMPTEFrameRate(static_cast<SMPTEFrameRate>(state.smpteRate));
+        setSyncMode(static_cast<SyncMode>(state.syncMode));
+
+        audioPlayer_.setGainDecibels(state.audioGainDb);
+        audioPlayer_.setMuted(state.isAudioMuted);
+        audioPlayer_.setDimmed(state.isAudioDimmed);
+
+        if (state.isFloatingWindowVisible)
+        {
+            showFloatingWindow(true);
+            if (floatingWindow_)
+            {
+                floatingWindow_->restoreWindowGeometry(state.floatingWindowGeometry);
+                floatingWindow_->setAlwaysOnTopActive(state.isAlwaysOnTop);
+                floatingWindow_->setBorderlessActive(state.isBorderless);
+                floatingWindow_->setClickThroughActive(state.isClickThrough);
+            }
+        }
+
+        if (!state.markersJson.isVoid())
+        {
+            markerModel_.importFromJson(state.markersJson);
+        }
+
+        if (state.videoFilePath.isNotEmpty())
+        {
+            juce::File vf(state.videoFilePath);
+            if (vf.existsAsFile())
+            {
+                loadVideoFile(vf);
+            }
+        }
+    }
 }
 
-juce::String MScoreVideoSyncProcessor::getLoadedVideoPath() const
+void MScoreVideoSyncProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
-    return lastLoadedVideoPath_;
+    SerializedPluginState state;
+    state.videoFilePath = lastLoadedVideoPath_;
+    state.videoOffsetSeconds = videoOffsetSeconds_.load(std::memory_order_relaxed);
+    state.smpteStartTimeSeconds = syncEngine_.getSmpteStartTime();
+    state.movieStartOffsetSeconds = syncEngine_.getMovieStartOffset();
+    state.displayLatencySeconds = syncEngine_.getDisplayLatencyCompensation();
+    state.trimInSeconds = syncEngine_.getTrimInSeconds();
+    state.trimOutSeconds = syncEngine_.getTrimOutSeconds();
+    state.smpteRate = static_cast<int>(smpteRate_.load(std::memory_order_relaxed));
+    state.syncMode = static_cast<int>(syncEngine_.getSyncMode());
+
+    state.audioGainDb = audioPlayer_.getGainDecibels();
+    state.isAudioMuted = audioPlayer_.isMuted();
+    state.isAudioDimmed = audioPlayer_.isDimmed();
+
+    state.isFloatingWindowVisible = isFloatingWindowVisible();
+    if (floatingWindow_)
+    {
+        state.floatingWindowGeometry = floatingWindow_->getWindowGeometryString();
+        state.isAlwaysOnTop = floatingWindow_->isAlwaysOnTopActive();
+        state.isBorderless = floatingWindow_->isBorderlessActive();
+        state.isClickThrough = floatingWindow_->isClickThroughActive();
+    }
+
+    state.markersJson = markerModel_.exportToJson();
+
+    auto vt = ProjectStateSerializer::toValueTree(state);
+    std::unique_ptr<juce::XmlElement> xml(vt.createXml());
+    if (xml != nullptr)
+    {
+        copyXmlToBinary(*xml, destData);
+    }
+}
+
+void MScoreVideoSyncProcessor::setStateInformation(const void* data, int sizeInBytes)
+{
+    if (data == nullptr || sizeInBytes <= 0)
+    {
+        loadPersistentSettings();
+        return;
+    }
+
+    std::unique_ptr<juce::XmlElement> xml = getXmlFromBinary(data, sizeInBytes);
+    if (xml == nullptr)
+    {
+        juce::String xmlText = juce::String::createStringFromData(data, sizeInBytes);
+        if (xmlText.isNotEmpty()) xml = juce::XmlDocument::parse(xmlText);
+    }
+
+    if (xml && xml->hasTagName("MScoreVideoSyncProject"))
+    {
+        auto vt = juce::ValueTree::fromXml(*xml);
+        auto state = ProjectStateSerializer::fromValueTree(vt);
+
+        setVideoOffset(state.videoOffsetSeconds);
+        syncEngine_.setSmpteStartTime(state.smpteStartTimeSeconds);
+        syncEngine_.setMovieStartOffset(state.movieStartOffsetSeconds);
+        syncEngine_.setDisplayLatencyCompensation(state.displayLatencySeconds);
+        syncEngine_.setTrimRange(state.trimInSeconds, state.trimOutSeconds);
+
+        setSMPTEFrameRate(static_cast<SMPTEFrameRate>(state.smpteRate));
+        setSyncMode(static_cast<SyncMode>(state.syncMode));
+
+        audioPlayer_.setGainDecibels(state.audioGainDb);
+        audioPlayer_.setMuted(state.isAudioMuted);
+        audioPlayer_.setDimmed(state.isAudioDimmed);
+
+        if (state.isFloatingWindowVisible)
+        {
+            showFloatingWindow(true);
+            if (floatingWindow_)
+            {
+                floatingWindow_->restoreWindowGeometry(state.floatingWindowGeometry);
+                floatingWindow_->setAlwaysOnTopActive(state.isAlwaysOnTop);
+                floatingWindow_->setBorderlessActive(state.isBorderless);
+                floatingWindow_->setClickThroughActive(state.isClickThrough);
+            }
+        }
+
+        if (!state.markersJson.isVoid())
+        {
+            markerModel_.importFromJson(state.markersJson);
+        }
+
+        if (state.videoFilePath.isNotEmpty())
+        {
+            juce::File vf(state.videoFilePath);
+            if (vf.existsAsFile())
+            {
+                loadVideoFile(vf);
+            }
+        }
+    }
+    else
+    {
+        loadPersistentSettings();
+    }
 }
 
 } // namespace MScoreVideoSync
 
-// JUCE Plugin Filter Creator
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new MScoreVideoSync::MScoreVideoSyncProcessor();

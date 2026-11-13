@@ -2,13 +2,21 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "CommonTypes.h"
-#include "TempoMapTracker.h"
-#include "../Video/FFmpegDecoder.h"
+#include "ProjectState.h"
+#include "../Sync/TransportSyncEngine.h"
+#include "../Sync/SharedMemoryIPC.h"
+#include "../Sync/NetworkBridge.h"
+#include "../Video/VideoDecodeEngine.h"
+#include "../Audio/EmbeddedAudioPlayer.h"
+#include "../Audio/TwoPopGenerator.h"
+#include "../Cues/CueMarkerModel.h"
+#include "../UI/Window/FloatingVideoWindow.h"
 
 namespace MScoreVideoSync
 {
 
-class MScoreVideoSyncProcessor : public juce::AudioProcessor
+class MScoreVideoSyncProcessor : public juce::AudioProcessor,
+                                 public NetworkBridge::CommandListener
 {
 public:
     MScoreVideoSyncProcessor();
@@ -45,38 +53,64 @@ public:
     void getStateInformation(juce::MemoryBlock& destData) override;
     void setStateInformation(const void* data, int sizeInBytes) override;
 
-    // Video Engine Access
-    FFmpegDecoder& getDecoder() noexcept { return decoder_; }
-    TempoMapTracker& getTempoTracker() noexcept { return tempoTracker_; }
+    // Subsystem accessors
+    VideoDecodeEngine& getDecoder() noexcept { return decoder_; }
+    TransportSyncEngine& getSyncEngine() noexcept { return syncEngine_; }
+    EmbeddedAudioPlayer& getAudioPlayer() noexcept { return audioPlayer_; }
+    TwoPopGenerator& getTwoPopGenerator() noexcept { return twoPopGen_; }
+    CueMarkerModel& getMarkerModel() noexcept { return markerModel_; }
+    SharedMemoryIPC& getIPC() noexcept { return ipc_; }
+    NetworkBridge& getNetworkBridge() noexcept { return networkBridge_; }
 
-    // Video offset control
-    void setVideoOffset(double offsetSeconds);
-    double getVideoOffset() const noexcept;
-
-    // SMPTE Frame Rate setting
-    void setSMPTEFrameRate(SMPTEFrameRate rate);
-    SMPTEFrameRate getSMPTEFrameRate() const noexcept;
-
-    // Sync Mode (DAWPlayHead, Auto, AudioStream, MIDIClock, Manual)
-    void setSyncMode(SyncMode mode);
-    SyncMode getSyncMode() const noexcept;
-
-    // Locate transport / score request
-    void requestHostLocate(double timeSeconds);
+    // Persistent Floating Window (lives in processor to survive MuseScore 4 editor destruction)
+    void showFloatingWindow(bool show);
+    bool isFloatingWindowVisible() const;
+    FloatingVideoWindow* getFloatingWindow() noexcept { return floatingWindow_.get(); }
 
     // File loading
     bool loadVideoFile(const juce::File& file);
     void closeVideoFile();
     juce::String getLoadedVideoPath() const;
 
-    // Persistent storage helpers (Application Support fallback)
+    // Settings & Controls
+    void setVideoOffset(double offsetSeconds);
+    double getVideoOffset() const noexcept;
+
+    void setSMPTEFrameRate(SMPTEFrameRate rate);
+    SMPTEFrameRate getSMPTEFrameRate() const noexcept;
+
+    void setSyncMode(SyncMode mode);
+    SyncMode getSyncMode() const noexcept;
+
+    // Locate request
+    void requestHostLocate(double timeSeconds);
+
+    // NetworkBridge::CommandListener overrides
+    void onRemotePlay() override;
+    void onRemotePause() override;
+    void onRemoteStop() override;
+    void onRemoteLocate(double timeSeconds) override;
+
     void savePersistentSettings();
     void loadPersistentSettings();
 
 private:
-    FFmpegDecoder decoder_;
-    TempoMapTracker tempoTracker_;
+    template <typename FloatType>
+    void processBlockInternal(juce::AudioBuffer<FloatType>& buffer, juce::MidiBuffer& midiMessages);
 
+    // Engines
+    VideoDecodeEngine decoder_;
+    TransportSyncEngine syncEngine_;
+    EmbeddedAudioPlayer audioPlayer_;
+    TwoPopGenerator twoPopGen_;
+    CueMarkerModel markerModel_;
+    SharedMemoryIPC ipc_;
+    NetworkBridge networkBridge_;
+
+    // Persistent Window
+    std::unique_ptr<FloatingVideoWindow> floatingWindow_;
+
+    // Parameters
     juce::AudioParameterFloat* paramOffset_{ nullptr };
     juce::AudioParameterChoice* paramSmpteRate_{ nullptr };
     juce::AudioParameterChoice* paramSyncMode_{ nullptr };
@@ -84,6 +118,7 @@ private:
     std::atomic<SMPTEFrameRate> smpteRate_{ SMPTEFrameRate::FPS_24 };
     std::atomic<double> videoOffsetSeconds_{ 0.0 };
     std::atomic<double> pendingMidiLocateTime_{ -1.0 };
+    std::atomic<double> lastProcessedPts_{ -1.0 };
 
     juce::String lastLoadedVideoPath_;
 

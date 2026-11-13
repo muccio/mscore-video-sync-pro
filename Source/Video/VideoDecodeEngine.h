@@ -2,13 +2,16 @@
 
 #include "../Core/CommonTypes.h"
 #include "LockFreeFrameQueue.h"
+#include "FilmstripGenerator.h"
+#include "WaveformExtractor.h"
 #include <juce_core/juce_core.h>
 #include <juce_graphics/juce_graphics.h>
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <vector>
+#include <deque>
 
-// Forward declarations for FFmpeg C structs
 struct AVFormatContext;
 struct AVCodecContext;
 struct AVStream;
@@ -20,30 +23,32 @@ struct AVBufferRef;
 namespace MScoreVideoSync
 {
 
-class FFmpegDecoder : public juce::Thread
+class VideoDecodeEngine : public juce::Thread
 {
 public:
-    FFmpegDecoder();
-    ~FFmpegDecoder() override;
+    VideoDecodeEngine();
+    ~VideoDecodeEngine() override;
 
-    // Open video file and initialize VideoToolbox / software decoders
     bool openFile(const juce::File& videoFile);
     void closeFile();
 
-    // Transport synchronization updates (called from UI / Audio sync layer)
+    // Transport synchronization updates
     void setPlaybackState(bool isPlaying, double targetPts);
     void requestSeek(double targetPts);
 
-    // Lock-free access to latest decoded frame for rendering
+    // Frame retrieval for rendering (lock-free)
     const DecodedVideoFrame* getLatestFrame() noexcept;
 
-    // Metadata and state queries
+    // Metadata & status
     VideoMetadata getMetadata() const;
     bool isFileLoaded() const noexcept;
     bool isHardwareAccelerated() const noexcept;
     double getCurrentDecodedPts() const noexcept;
 
-    // Listener for file load completion or errors
+    // Background track extractors
+    FilmstripGenerator& getFilmstripGenerator() noexcept { return filmstripGenerator_; }
+    WaveformExtractor& getWaveformExtractor() noexcept { return waveformExtractor_; }
+
     class Listener
     {
     public:
@@ -56,20 +61,26 @@ public:
     void removeListener(Listener* listener);
 
 private:
-    // juce::Thread main loop
     void run() override;
 
-    // FFmpeg initialization routines
     bool initHardwareContext();
     bool initCodecContext();
     void cleanupFFmpeg();
 
-    // Frame decoding and conversion helpers
     bool decodeNextFrame(bool& reachedEof, double targetCommitPts = -1.0);
     bool performSeek(double targetSeconds);
     void convertFrameToImage(AVFrame* srcFrame, DecodedVideoFrame* destFrame);
 
-    // FFmpeg context pointers
+    // Predictive Ring Buffer for bidirectional scrubbing
+    struct CachedFrame
+    {
+        double pts = 0.0;
+        juce::Image image;
+    };
+
+    bool tryLookupCachedFrame(double targetPts, DecodedVideoFrame* dest);
+    void cacheFrame(double pts, const juce::Image& image);
+
     AVFormatContext* formatCtx_{ nullptr };
     AVCodecContext* codecCtx_{ nullptr };
     AVBufferRef* hwDeviceCtx_{ nullptr };
@@ -80,27 +91,35 @@ private:
     int videoStreamIndex_{ -1 };
     AVStream* videoStream_{ nullptr };
 
-    // Video properties
     VideoMetadata metadata_;
     std::atomic<bool> isLoaded_{ false };
     std::atomic<bool> isHwAccelActive_{ false };
     std::atomic<double> currentDecodedPts_{ 0.0 };
 
-    // Playback control and synchronization
     std::atomic<bool> isPlaying_{ false };
     std::atomic<double> targetPts_{ 0.0 };
+    std::atomic<double> prevPlaybackTargetPts_{ -1.0 };
     std::atomic<bool> seekRequested_{ false };
+    std::atomic<bool> isSeeking_{ false };
+    std::atomic<bool> streamNeedsSeek_{ false };
     std::atomic<double> seekTargetPts_{ 0.0 };
     std::atomic<double> lastSeekTargetPts_{ -1.0 };
 
-    // Frame buffer
     LockFreeFrameQueue frameQueue_;
 
-    // Thread synchronization & listeners
+    // Bidirectional scrubbing cache (holds up to 32 frames around playhead)
+    static constexpr size_t MaxCachedFrames = 32;
+    std::deque<CachedFrame> frameRingCache_;
+    std::mutex cacheMutex_;
+
+    // Sub-generators
+    FilmstripGenerator filmstripGenerator_;
+    WaveformExtractor waveformExtractor_;
+
     std::mutex fileMutex_;
     juce::ListenerList<Listener> listeners_;
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FFmpegDecoder)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(VideoDecodeEngine)
 };
 
 } // namespace MScoreVideoSync
